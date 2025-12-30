@@ -42,8 +42,8 @@ async fn main() {
     let state = AppState { db: Arc::new(Mutex::new(conn)) };
 
     let app = Router::new()
-        .route("/counter.gif",  get(count_page_view))
-        .route("/stats.json", get(export))
+        .route("/counter.gif", get(count_page_view))
+        .route("/stats.json",  get(export))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
@@ -79,14 +79,21 @@ async fn count_page_view(
 }
 
 async fn export(
-    State(state): State<AppState>
+    State(state): State<AppState>,
+    Query(params): Query<Params>,
 ) -> impl IntoResponse {
 
     let db = state.db.lock().unwrap();
 
-    // Fetch all events
-    let mut stmt = db.prepare("SELECT ts, domain, page FROM pageviews ORDER BY ts DESC").unwrap();
-    let rows = stmt.query_map([], |row| {
+    // Fetch events, optionally filtered by domain
+    let (query, params_vec): (&str, Vec<&dyn rusqlite::ToSql>) = if let Some(ref domain) = params.domain {
+        ("SELECT ts, domain, page FROM pageviews WHERE domain = ? ORDER BY ts DESC", vec![domain])
+    } else {
+        ("SELECT ts, domain, page FROM pageviews ORDER BY ts DESC", vec![])
+    };
+
+    let mut stmt = db.prepare(query).unwrap();
+    let rows = stmt.query_map(params_vec.as_slice(), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
     }).unwrap();
 

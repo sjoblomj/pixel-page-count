@@ -53,6 +53,16 @@ Example response:
 }
 ```
 
+#### Filtering by domain
+
+You can optionally filter the analytics data by domain:
+
+```bash
+curl http://localhost:8080/stats.json?domain=example.com
+```
+
+This will return only the page views for the specified domain. If no domain parameter is provided, all page views are returned.
+
 ## Data Storage
 
 Page views are stored in `data/analytics.db` (SQLite).
