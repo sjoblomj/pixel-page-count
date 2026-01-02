@@ -30,14 +30,60 @@ async fn main() {
     };
 
     let conn = Connection::open(db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS pageviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            domain TEXT NOT NULL,
-            page TEXT NOT NULL
-        );"
-    ).unwrap();
+
+    // Check if we need to migrate from old schema
+    let needs_migration = conn.query_row(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='pageviews'",
+        [],
+        |row| row.get::<_, String>(0)
+    ).is_ok() && conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='pageviews'",
+        [],
+        |row| row.get::<_, String>(0)
+    ).unwrap_or_default().contains("ts INTEGER");
+
+    if needs_migration {
+        println!("Migrating database from timestamp-based to date-based schema...");
+
+        // Rename old table
+        conn.execute("ALTER TABLE pageviews RENAME TO pageviews_old", []).unwrap();
+
+        // Create new table with date-based schema
+        conn.execute_batch(
+            "CREATE TABLE pageviews (
+                domain TEXT NOT NULL,
+                page TEXT NOT NULL,
+                date TEXT NOT NULL,
+                view_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (domain, page, date)
+            );"
+        ).unwrap();
+
+        // Migrate data with aggregation
+        conn.execute(
+            "INSERT INTO pageviews (domain, page, date, view_count)
+             SELECT domain, page, date(ts, 'unixepoch') as date, COUNT(*) as view_count
+             FROM pageviews_old
+             GROUP BY domain, page, date(ts, 'unixepoch')",
+            []
+        ).unwrap();
+
+        // Drop old table
+        conn.execute("DROP TABLE pageviews_old", []).unwrap();
+
+        println!("Migration completed successfully!");
+    } else {
+        // Create new table if it doesn't exist
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pageviews (
+                domain TEXT NOT NULL,
+                page TEXT NOT NULL,
+                date TEXT NOT NULL,
+                view_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (domain, page, date)
+            );"
+        ).unwrap();
+    }
 
     let state = AppState { db: Arc::new(Mutex::new(conn)) };
 
@@ -64,12 +110,14 @@ async fn count_page_view(
 ) -> impl IntoResponse {
     let domain = params.domain.unwrap_or_else(|| "unknown".into());
     let page = params.page.unwrap_or_else(|| "/unknown".into());
-    let ts = OffsetDateTime::now_utc().unix_timestamp();
+    let date = OffsetDateTime::now_utc().date();
+    let date_str = format!("{:04}-{:02}-{:02}", date.year(), date.month() as u8, date.day());
 
     let db = state.db.lock().unwrap();
     let _ = db.execute(
-        "INSERT INTO pageviews (ts, domain, page) VALUES (?, ?, ?)",
-        (ts, domain, page),
+        "INSERT INTO pageviews (domain, page, date, view_count) VALUES (?, ?, ?, 1)
+         ON CONFLICT (domain, page, date) DO UPDATE SET view_count = view_count + 1",
+        (domain, page, date_str),
     );
 
     (
@@ -85,40 +133,49 @@ async fn export(
 
     let db = state.db.lock().unwrap();
 
-    // Fetch events, optionally filtered by domain
+    // Fetch pageview records, optionally filtered by domain
     let (query, params_vec): (&str, Vec<&dyn rusqlite::ToSql>) = if let Some(ref domain) = params.domain {
-        ("SELECT ts, domain, page FROM pageviews WHERE domain = ? ORDER BY ts DESC", vec![domain])
+        ("SELECT domain, page, date, view_count FROM pageviews WHERE domain = ? ORDER BY date DESC", vec![domain])
     } else {
-        ("SELECT ts, domain, page FROM pageviews ORDER BY ts DESC", vec![])
+        ("SELECT domain, page, date, view_count FROM pageviews ORDER BY date DESC", vec![])
     };
 
     let mut stmt = db.prepare(query).unwrap();
     let rows = stmt.query_map(params_vec.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?
+        ))
     }).unwrap();
 
-    let mut latest = Vec::new();
+    let mut pageviews = Vec::new();
     let mut pages = std::collections::HashSet::new();
+    let mut total_views = 0i64;
 
     for row in rows {
-        let (ts, domain, page) = row.unwrap();
+        let (domain, page, date, view_count) = row.unwrap();
         pages.insert(page.clone());
+        total_views += view_count;
 
-        latest.push(serde_json::json!({
-            "ts": ts,
+        pageviews.push(serde_json::json!({
             "domain": domain,
-            "page": page
+            "page": page,
+            "date": date,
+            "view_count": view_count
         }));
     }
 
     let summary = serde_json::json!({
         "unique_pages": pages.len(),
-        "total_events": latest.len()
+        "total_views": total_views,
+        "total_records": pageviews.len()
     });
 
     let result = serde_json::json!({
         "summary": summary,
-        "latest": latest
+        "pageviews": pageviews
     });
 
     (
