@@ -30,60 +30,15 @@ async fn main() {
     };
 
     let conn = Connection::open(db_path).unwrap();
-
-    // Check if we need to migrate from old schema
-    let needs_migration = conn.query_row(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='pageviews'",
-        [],
-        |row| row.get::<_, String>(0)
-    ).is_ok() && conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='pageviews'",
-        [],
-        |row| row.get::<_, String>(0)
-    ).unwrap_or_default().contains("ts INTEGER");
-
-    if needs_migration {
-        println!("Migrating database from timestamp-based to date-based schema...");
-
-        // Rename old table
-        conn.execute("ALTER TABLE pageviews RENAME TO pageviews_old", []).unwrap();
-
-        // Create new table with date-based schema
-        conn.execute_batch(
-            "CREATE TABLE pageviews (
-                domain TEXT NOT NULL,
-                page TEXT NOT NULL,
-                date TEXT NOT NULL,
-                view_count INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (domain, page, date)
-            );"
-        ).unwrap();
-
-        // Migrate data with aggregation
-        conn.execute(
-            "INSERT INTO pageviews (domain, page, date, view_count)
-             SELECT domain, page, date(ts, 'unixepoch') as date, COUNT(*) as view_count
-             FROM pageviews_old
-             GROUP BY domain, page, date(ts, 'unixepoch')",
-            []
-        ).unwrap();
-
-        // Drop old table
-        conn.execute("DROP TABLE pageviews_old", []).unwrap();
-
-        println!("Migration completed successfully!");
-    } else {
-        // Create new table if it doesn't exist
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS pageviews (
-                domain TEXT NOT NULL,
-                page TEXT NOT NULL,
-                date TEXT NOT NULL,
-                view_count INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (domain, page, date)
-            );"
-        ).unwrap();
-    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pageviews (
+            domain TEXT NOT NULL,
+            page TEXT NOT NULL,
+            date TEXT NOT NULL,
+            view_count INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (domain, page, date)
+        );"
+    ).unwrap();
 
     let state = AppState { db: Arc::new(Mutex::new(conn)) };
 
